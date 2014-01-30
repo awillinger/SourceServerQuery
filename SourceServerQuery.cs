@@ -19,6 +19,10 @@ namespace SteamMasterServer.Lib
         // multi-packet responses (currently only A2S_RULES)
         private UdpClient client;
 
+        // send & receive timeouts
+        private int send_timeout = 2500;
+        private int receive_timeout = 2500;
+
         // raw response returned from the server
         private byte[] raw_data;
 
@@ -60,22 +64,42 @@ namespace SteamMasterServer.Lib
             this.socket.Send(request);
 
             this.raw_data = new byte[1024];
-            this.socket.Receive(this.raw_data);
 
-            // read data
-            sr.name = this.ReadString();
-            sr.map = this.ReadString();
-            sr.directory = this.ReadString();
-            sr.game = this.ReadString();
-            sr.appid = this.ReadInt16();
-            sr.players = this.ReadByte();
-            sr.maxplayers = this.ReadByte();
-            sr.bots = this.ReadByte();
-            sr.dedicated = (this.ReadChar() == 'd')?true:false;
-            sr.os = (this.ReadChar() == 'l')?"Linux":"Windows";
-            sr.password = (this.ReadByte() == 1)?true:false;
-            sr.secure = (this.ReadByte() == 1)?true:false;
-            sr.version = this.ReadString();
+            try
+            {
+                this.socket.Receive(this.raw_data);
+
+                // read data
+                sr.name = this.ReadString();
+                sr.map = this.ReadString();
+                sr.directory = this.ReadString();
+                sr.game = this.ReadString();
+                sr.appid = this.ReadInt16();
+                sr.players = this.ReadByte();
+                sr.maxplayers = this.ReadByte();
+                sr.bots = this.ReadByte();
+                sr.dedicated = (this.ReadChar() == 'd') ? true : false;
+                sr.os = (this.ReadChar() == 'l') ? "Linux" : "Windows";
+                sr.password = (this.ReadByte() == 1) ? true : false;
+                sr.secure = (this.ReadByte() == 1) ? true : false;
+                sr.version = this.ReadString();
+            }
+            catch (SocketException e)
+            {
+                sr.name = "N/A (request timed out)";
+                sr.map = "N/A";
+                sr.directory = "N/A";
+                sr.game = "N/A";
+                sr.appid = -1;
+                sr.players = 0;
+                sr.maxplayers = 0;
+                sr.bots = -1;
+                sr.dedicated = false;
+                sr.os = "N/A";
+                sr.password = false;
+                sr.secure = false;
+                sr.version = "N/A";
+            }
 
             return sr;
         }
@@ -94,40 +118,47 @@ namespace SteamMasterServer.Lib
             // we don't need the header, so set pointer to where the payload begins
             this.offset = 5;
 
-            PlayersResponse pr = new PlayersResponse();
-
-            // since A2S_PLAYER requests require a valid challenge, get it first
-            byte[] challenge = this.GetChallenge(A2S_PLAYER, true);
-
-            byte[] request = new byte[challenge.Length+this.A2S_HEADER.Length+1];
-            Array.Copy(this.A2S_HEADER, 0, request, 0, this.A2S_HEADER.Length);
-            request[this.A2S_HEADER.Length] = A2S_PLAYER;
-            Array.Copy(challenge, 0, request, this.A2S_HEADER.Length + 1, challenge.Length);
-
-            this.socket.Send(request);
-
-            this.raw_data = new byte[1024];
-            this.socket.Receive(this.raw_data);
-
-            byte player_count = this.ReadByte();
-
-            // fill up the list of players
-            for (int i = 0; i < player_count; i++)
+            try
             {
-                this.ReadByte();
+                PlayersResponse pr = new PlayersResponse();
 
-                PlayersResponse.Player p = new PlayersResponse.Player();
+                // since A2S_PLAYER requests require a valid challenge, get it first
+                byte[] challenge = this.GetChallenge(A2S_PLAYER, true);
 
-                p.name = this.ReadString();
-                p.score = this.ReadInt32();
-                p.playtime = this.ReadFloat();
+                byte[] request = new byte[challenge.Length+this.A2S_HEADER.Length+1];
+                Array.Copy(this.A2S_HEADER, 0, request, 0, this.A2S_HEADER.Length);
+                request[this.A2S_HEADER.Length] = A2S_PLAYER;
+                Array.Copy(challenge, 0, request, this.A2S_HEADER.Length + 1, challenge.Length);
 
-                pr.players.Add(p);
+                this.socket.Send(request);
+
+                this.raw_data = new byte[1024];
+                this.socket.Receive(this.raw_data);
+
+                byte player_count = this.ReadByte();
+
+                // fill up the list of players
+                for (int i = 0; i < player_count; i++)
+                {
+                    this.ReadByte();
+
+                    PlayersResponse.Player p = new PlayersResponse.Player();
+
+                    p.name = this.ReadString();
+                    p.score = this.ReadInt32();
+                    p.playtime = this.ReadFloat();
+
+                    pr.players.Add(p);
+                }
+
+                pr.player_count = player_count;
+
+                return pr;
             }
-
-            pr.player_count = player_count;
-
-            return pr;
+            catch (SocketException e)
+            {
+                return null;
+            }           
         }
 
         /// <summary>
@@ -143,140 +174,152 @@ namespace SteamMasterServer.Lib
             // open udpclient if not already open
             this.GetClient();
 
-            RulesResponse rr = new RulesResponse();
-
-            // similar to A2S_PLAYER requests, A2S_RULES require a valid challenge
-            byte[] challenge = this.GetChallenge(A2S_RULES, false);
-
-            byte[] request = new byte[challenge.Length + this.A2S_HEADER.Length + 1];
-            Array.Copy(this.A2S_HEADER, 0, request, 0, this.A2S_HEADER.Length);
-            request[this.A2S_HEADER.Length] = A2S_RULES;
-            Array.Copy(challenge, 0, request, this.A2S_HEADER.Length + 1, challenge.Length);
-
-            this.client.Send(request, request.Length);
-
-            //
-            // Since A2S_RULES responses might be split up into several packages/compressed, we have to do a special handling of them
-            //
-            int bytesRead;
-            // this will keep our assembled message
-            byte[] buffer = new byte[4096];
-
-            // send first request
-            this.raw_data = this.client.Receive(ref this.remote);
-            
-            bytesRead = this.raw_data.Length;
-
-            // reset pointer 
-            this.offset = 0;
-
-            int is_split = this.ReadInt32();
-            int requestid = this.ReadInt32();
-
-            this.offset = 4;
-
-            // response is split up into several packets
-            if (this.PacketIsSplit(is_split))
+            try
             {
-                
-                bool isCompressed = false;
-                byte[] splitData;
-                int packetCount, packetNumber, requestId;
-                int packetsReceived = 1;
-                int packetChecksum = 0;
-                int packetSplit = 0;
-                short splitSize;
-                int uncompressedSize = 0;
-                List<byte[]> splitPackets = new List<byte[]>();
+                RulesResponse rr = new RulesResponse();
 
-                do
+                // similar to A2S_PLAYER requests, A2S_RULES require a valid challenge
+                byte[] challenge = this.GetChallenge(A2S_RULES, false);
+
+                byte[] request = new byte[challenge.Length + this.A2S_HEADER.Length + 1];
+                Array.Copy(this.A2S_HEADER, 0, request, 0, this.A2S_HEADER.Length);
+                request[this.A2S_HEADER.Length] = A2S_RULES;
+                Array.Copy(challenge, 0, request, this.A2S_HEADER.Length + 1, challenge.Length);
+
+                this.client.Send(request, request.Length);
+
+                //
+                // Since A2S_RULES responses might be split up into several packages/compressed, we have to do a special handling of them
+                //
+                int bytesRead;
+
+                // this will keep our assembled message
+                byte[] buffer = new byte[4096];
+
+                // send first request
+
+                this.raw_data = this.client.Receive(ref this.remote);
+
+                bytesRead = this.raw_data.Length;
+
+                // reset pointer 
+                this.offset = 0;
+
+                int is_split = this.ReadInt32();
+                int requestid = this.ReadInt32();
+
+                this.offset = 4;
+
+                // response is split up into several packets
+                if (this.PacketIsSplit(is_split))
                 {
-                    // unique request id 
-                    requestId = this.ReverseBytes(this.ReadInt32());
-                    isCompressed = this.PacketIsCompressed(requestId);
+                    bool isCompressed = false;
+                    byte[] splitData;
+                    int packetCount, packetNumber, requestId;
+                    int packetsReceived = 1;
+                    int packetChecksum = 0;
+                    int packetSplit = 0;
+                    short splitSize;
+                    int uncompressedSize = 0;
+                    List<byte[]> splitPackets = new List<byte[]>();
 
-                    packetCount = this.ReadByte();
-                    packetNumber = this.ReadByte() +1;
-                    // so we know how big our byte arrays have to be
-                    splitSize = this.ReadInt16();
-                    splitSize -= 4; // fix
-
-                    if (packetsReceived == 1)
+                    do
                     {
-                        for (int i = 0; i < packetCount; i++)
+                        // unique request id 
+                        requestId = this.ReverseBytes(this.ReadInt32());
+                        isCompressed = this.PacketIsCompressed(requestId);
+
+                        packetCount = this.ReadByte();
+                        packetNumber = this.ReadByte() + 1;
+                        // so we know how big our byte arrays have to be
+                        splitSize = this.ReadInt16();
+                        splitSize -= 4; // fix
+
+                        if (packetsReceived == 1)
                         {
-                            splitPackets.Add(new byte[] { });
+                            for (int i = 0; i < packetCount; i++)
+                            {
+                                splitPackets.Add(new byte[] { });
+                            }
+                        }
+
+                        // if the packets are compressed, get some data to decompress them
+                        if (isCompressed)
+                        {
+                            uncompressedSize = ReverseBytes(this.ReadInt32());
+                            packetChecksum = ReverseBytes(this.ReadInt32());
+                        }
+
+                        // ommit header in first packet
+                        if (packetNumber == 1) this.ReadInt32();
+
+                        splitData = new byte[splitSize];
+                        splitPackets[packetNumber - 1] = this.ReadBytes();
+
+                        // fixes a case where the returned package might still contain a character after the last \0 terminator (truncated name => value)
+                        // please note: this therefore also removes the value of said variable, but atleast the program won't crash
+                        if (splitPackets[packetNumber-1].Length -1 > 0 && splitPackets[packetNumber - 1][splitPackets[packetNumber - 1].Length - 1] != 0x00)
+                        {
+                            splitPackets[packetNumber - 1][splitPackets[packetNumber - 1].Length - 1] = 0x00;
+                        }
+
+                        // reset pointer again, so we can copy over the contents
+                        this.offset = 0;
+
+                        if (packetsReceived < packetCount)
+                        {
+
+                            this.raw_data = this.client.Receive(ref this.remote);
+                            bytesRead = this.raw_data.Length;
+
+                            // continue with the next packets
+                            packetSplit = this.ReadInt32();
+                            packetsReceived++;
+                        }
+                        else
+                        {
+                            // all packets received
+                            bytesRead = 0;
                         }
                     }
+                    while (packetsReceived <= packetCount && bytesRead > 0 && packetSplit == -2);
 
-                    // if the packets are compressed, get some data to decompress them
+                    // decompress
                     if (isCompressed)
                     {
-                        uncompressedSize = ReverseBytes(this.ReadInt32());
-                        packetChecksum = ReverseBytes(this.ReadInt32());
-                    }
-
-                    // ommit header in first packet
-                    if (packetNumber == 1) this.ReadInt32();
-
-                    splitData = new byte[splitSize];
-                    splitPackets[packetNumber - 1] = this.ReadBytes();
-
-                    // reset pointer again, so we can copy over the contents
-                    this.offset = 0;
-
-                    if (packetsReceived < packetCount)
-                    {
-                        this.raw_data = this.client.Receive(ref this.remote);
-                        bytesRead = this.raw_data.Length;
-
-                        // continue with the next packets
-                        packetSplit = this.ReadInt32();
-                        packetsReceived++;
+                        buffer = ReassemblePacket(splitPackets, true, uncompressedSize, packetChecksum);
                     }
                     else
                     {
-                        // all packets received
-                        bytesRead = 0;
+                        buffer = ReassemblePacket(splitPackets, false, 0, 0);
                     }
-                }
-                while (packetsReceived <= packetCount && bytesRead > 0 && packetSplit == -2);
-
-                // decompress
-                if (isCompressed)
-                {
-                    buffer = ReassemblePacket(splitPackets, true, uncompressedSize, packetChecksum);
                 }
                 else
                 {
-                    buffer = ReassemblePacket(splitPackets, false, 0, 0);
+                    buffer = this.raw_data;
                 }
+
+                // move our final result over to handle it
+                this.raw_data = buffer;
+
+                // omitting header
+                this.offset = 1;
+                rr.rule_count = this.ReadInt16();
+
+                for (int i = 0; i < rr.rule_count; i++)
+                {
+                    RulesResponse.Rule rule = new RulesResponse.Rule();
+                    rule.name = this.ReadString();
+                    rule.value = this.ReadString();
+                    rr.rules.Add(rule);
+                }
+
+                return rr;
             }
-            else
+            catch (SocketException e)
             {
-                buffer = this.raw_data;
+                return null;
             }
-
-            // move our final result over to handle it
-            this.raw_data = buffer;
-            // omitting header
-            this.offset = 1;
-
-            short rules_count = 0;
-
-            rules_count = this.ReadInt16();
-
-            for (int i = 0; i < rules_count; i++)
-            {
-                RulesResponse.Rule rule = new RulesResponse.Rule();
-                rule.name = this.ReadString();
-                rule.value = this.ReadString();
-                rr.rules.Add(rule);
-            }
-
-            rr.rule_count = rules_count;
-
-            return rr;
         }
 
         /// <summary>
@@ -286,6 +329,45 @@ namespace SteamMasterServer.Lib
         {
             if (this.socket != null) this.socket.Close();
             if (this.client != null) this.client.Close();
+        }
+
+        /// <summary>
+        /// Set the IP and Port used in this Object.
+        /// </summary>
+        /// <param name="ip">The Server IP</param>
+        /// <param name="port">The Server Port</param>
+        public void SetAddress(String ip, int port)
+        {
+            this.remote = new IPEndPoint(IPAddress.Parse(ip), port);
+
+            if (this.socket != null)
+            {
+                this.socket.Close();
+                this.socket = null;
+            }
+            if (this.client != null)
+            {
+                this.client.Close();
+                this.client = null;
+            }
+        }
+
+        /// <summary>
+        /// Sets the Send Timeout on both the Socket and the Client
+        /// </summary>
+        /// <param name="timeout"></param>
+        public void SetSendTimeout(int timeout)
+        {
+            this.send_timeout = timeout;
+        }
+
+        /// <summary>
+        /// Sets the Receive Timeout on both the Socket and the Client
+        /// </summary>
+        /// <param name="timeout"></param>
+        public void SetReceiveTimeout(int timeout)
+        {
+            this.receive_timeout = timeout;
         }
 
         /// <summary>
@@ -299,6 +381,9 @@ namespace SteamMasterServer.Lib
                             AddressFamily.InterNetwork,
                             SocketType.Dgram,
                             ProtocolType.Udp);
+
+                this.socket.SendTimeout = this.send_timeout;
+                this.socket.ReceiveTimeout = this.receive_timeout;
 
                 this.socket.Connect(this.remote);
             }
@@ -314,7 +399,9 @@ namespace SteamMasterServer.Lib
                 this.client = new UdpClient();
                 this.client.Connect(this.remote);
                 this.client.DontFragment = true;
-                this.client.Client.ReceiveTimeout = 10000;
+
+                this.client.Client.SendTimeout = this.send_timeout;
+                this.client.Client.ReceiveTimeout = this.receive_timeout;
             }
         }
 
@@ -467,7 +554,10 @@ namespace SteamMasterServer.Lib
         /// <returns>All remaining data</returns>
         private Byte[] ReadBytes()
         {
-            byte[] b = new byte[this.raw_data.Length - this.offset - 4];
+            int size = (this.raw_data.Length - this.offset - 4);
+            if (size < 1) return new Byte[] { };
+
+            byte[] b = new byte[size];
             Array.Copy(this.raw_data, this.offset, b, 0, this.raw_data.Length - this.offset - 4);
 
             this.offset += (this.raw_data.Length - this.offset - 4);
@@ -538,10 +628,11 @@ namespace SteamMasterServer.Lib
 
             while(cache[0] != 0x00)
             {
+                if (this.offset == this.raw_data.Length) break; // fixes Valve's inability to code a proper query protocol
                 Array.Copy(this.raw_data, this.offset, cache, 0, 1);
-                if((this.offset+1)<this.raw_data.Length) this.offset++; // fixes ArgumentOutOfBoundException
+                this.offset++;
                 output += Encoding.UTF8.GetString(cache);
-            };
+            }
 
             return output;
         }
